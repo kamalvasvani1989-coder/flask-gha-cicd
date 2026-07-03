@@ -98,10 +98,10 @@ jobs:
             cd ~/flask-staging
             python3 -m venv venv
             ./venv/bin/pip install -q -r requirements.txt
-            pkill -f "[g]unicorn.*5001" || true
+            [ -f gunicorn.pid ] && kill "$(cat gunicorn.pid)" 2>/dev/null || true
             sleep 2
-            nohup ./venv/bin/gunicorn --bind 0.0.0.0:5001 app:app \
-              > staging.log 2>&1 &
+            nohup ./venv/bin/gunicorn --bind 0.0.0.0:5001 \
+              --pid gunicorn.pid app:app > staging.log 2>&1 &
             sleep 3
             curl -f http://localhost:5001/health
           '
@@ -144,10 +144,10 @@ jobs:
             cd ~/flask-production
             python3 -m venv venv
             ./venv/bin/pip install -q -r requirements.txt
-            pkill -f "[g]unicorn.*8000" || true
+            [ -f gunicorn.pid ] && kill "$(cat gunicorn.pid)" 2>/dev/null || true
             sleep 2
-            nohup ./venv/bin/gunicorn --bind 0.0.0.0:8000 app:app \
-              > production.log 2>&1 &
+            nohup ./venv/bin/gunicorn --bind 0.0.0.0:8000 \
+              --pid gunicorn.pid app:app > production.log 2>&1 &
             sleep 3
             curl -f http://localhost:8000/health
           '
