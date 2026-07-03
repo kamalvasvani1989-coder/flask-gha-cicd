@@ -1,0 +1,154 @@
+name: Flask CI/CD
+
+on:
+  push:
+    branches: [main, staging]   # CI on both branches; staging branch also deploys
+    tags: ['v*']                # tagged releases deploy to production
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  # ------------------------------------------------------------------
+  # Job 1: Install Dependencies  +  Job 2: Run Tests
+  # ------------------------------------------------------------------
+  test:
+    name: Install Dependencies & Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests with pytest
+        run: pytest test_app.py -v
+
+  # ------------------------------------------------------------------
+  # Job 3: Build - package the app only if tests pass
+  # ------------------------------------------------------------------
+  build:
+    name: Build
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Package application
+        run: |
+          mkdir -p dist
+          tar --exclude='./dist' --exclude='./.git' --exclude='./.github' \
+              -czf dist/flask-app.tar.gz .
+          ls -lh dist/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flask-app
+          path: dist/flask-app.tar.gz
+          retention-days: 7
+
+  # ------------------------------------------------------------------
+  # Job 4: Deploy to STAGING - only on push to the 'staging' branch
+  # ------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build
+    if: github.ref == 'refs/heads/staging'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: flask-app
+
+      - name: Deploy to staging server over SSH
+        env:
+          SSH_KEY_B64: ${{ secrets.STAGING_SSH_KEY_B64 }}
+          HOST:        ${{ secrets.STAGING_HOST }}
+          USER:        ${{ secrets.STAGING_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          # Key is stored base64-encoded (single line) - immune to
+          # line-ending / wrapping corruption when pasted into the secret.
+          echo "$SSH_KEY_B64" | base64 -d > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Fail fast with a readable message if the key didn't decode
+          ssh-keygen -y -f ~/.ssh/id_ed25519 > /dev/null || {
+            echo "::error::SSH key failed to parse - re-create the *_SSH_KEY_B64 secret"; exit 1; }
+
+          SSH_OPTS="-i $HOME/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
+
+          scp $SSH_OPTS flask-app.tar.gz "$USER@$HOST:/tmp/"
+          ssh $SSH_OPTS "$USER@$HOST" '
+            set -e
+            mkdir -p ~/flask-staging
+            tar -xzf /tmp/flask-app.tar.gz -C ~/flask-staging
+            cd ~/flask-staging
+            python3 -m venv venv
+            ./venv/bin/pip install -q -r requirements.txt
+            pkill -f "[g]unicorn.*5001" || true
+            sleep 2
+            nohup ./venv/bin/gunicorn --bind 0.0.0.0:5001 app:app \
+              > staging.log 2>&1 &
+            sleep 3
+            curl -f http://localhost:5001/health
+          '
+          echo "Staging deployment complete."
+
+  # ------------------------------------------------------------------
+  # Job 5: Deploy to PRODUCTION - only when a release tag (v*) is pushed
+  # ------------------------------------------------------------------
+  deploy-production:
+    name: Deploy to Production
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: flask-app
+
+      - name: Deploy to production server over SSH
+        env:
+          SSH_KEY_B64: ${{ secrets.PROD_SSH_KEY_B64 }}
+          HOST:        ${{ secrets.PROD_HOST }}
+          USER:        ${{ secrets.PROD_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY_B64" | base64 -d > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keygen -y -f ~/.ssh/id_ed25519 > /dev/null || {
+            echo "::error::SSH key failed to parse - re-create the *_SSH_KEY_B64 secret"; exit 1; }
+
+          SSH_OPTS="-i $HOME/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
+
+          scp $SSH_OPTS flask-app.tar.gz "$USER@$HOST:/tmp/"
+          ssh $SSH_OPTS "$USER@$HOST" '
+            set -e
+            mkdir -p ~/flask-production
+            tar -xzf /tmp/flask-app.tar.gz -C ~/flask-production
+            cd ~/flask-production
+            python3 -m venv venv
+            ./venv/bin/pip install -q -r requirements.txt
+            pkill -f "[g]unicorn.*8000" || true
+            sleep 2
+            nohup ./venv/bin/gunicorn --bind 0.0.0.0:8000 app:app \
+              > production.log 2>&1 &
+            sleep 3
+            curl -f http://localhost:8000/health
+          '
+          echo "Production deployment complete for ${{ github.ref_name }}."
